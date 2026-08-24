@@ -1,0 +1,138 @@
+
+import time
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+import fdtdx
+
+WAVELENGTH = 1.55e-6
+SPACING = WAVELENGTH / 20
+N = 60
+
+
+def build():
+    ON_MAIN = hasattr(fdtdx, "UniformGrid")
+    common = dict(time=50e-15, dtype=jnp.float32, courant_factor=0.99, gradient_config=None)
+    config = (
+        fdtdx.SimulationConfig(grid=fdtdx.UniformGrid(spacing=SPACING), **common)
+        if ON_MAIN
+        else fdtdx.SimulationConfig(resolution=SPACING, **common)
+    )
+
+    objects, constraints = [], []
+    volume = fdtdx.SimulationVolume(partial_grid_shape=(N, N, N))
+    objects.append(volume)
+
+    b_objs, b_cons = fdtdx.boundary_objects_from_config(
+        fdtdx.BoundaryConfig.from_uniform_bound(thickness=8, boundary_type="pml"), volume
+    )
+    objects.extend(b_objs.values())
+    constraints.extend(b_cons)
+
+    slab = fdtdx.UniformMaterialObject(
+        name="slab",
+        partial_grid_shape=(None, None, 12),
+        material=fdtdx.Material(permittivity=fdtdx.constants.relative_permittivity_silicon),
+    )
+    constraints.extend([slab.same_size(volume, axes=(0, 1)), slab.place_at_center(volume, axes=(0, 1, 2))])
+    objects.append(slab)
+
+    source = fdtdx.GaussianPlaneSource(
+        name="source",
+        partial_grid_shape=(None, None, 1),
+        fixed_E_polarization_vector=(1, 0, 0),
+        wave_character=fdtdx.WaveCharacter(wavelength=WAVELENGTH),
+        radius=N * SPACING / 5,
+        std=1 / 3,
+        direction="+",
+    )
+    constraints.extend(
+        [
+            source.same_size(volume, axes=(0, 1)),
+            source.place_at_center(volume, axes=(0, 1)),
+            source.place_relative_to(volume, axes=(2,), own_positions=(0,), other_positions=(-0.6,)),
+        ]
+    )
+    objects.append(source)
+
+    # Detector ABOVE the slab
+    det = fdtdx.EnergyDetector(
+        name="transmitted",
+        partial_grid_shape=(None, None, 1),
+        as_slices=False,
+        reduce_volume=True,          # one scalar per time step
+    )
+    constraints.extend(
+        [
+            det.same_size(volume, axes=(0, 1)),
+            det.place_at_center(volume, axes=(0, 1)),
+            det.place_relative_to(volume, axes=(2,), own_positions=(0,), other_positions=(0.6,)),
+        ]
+    )
+    objects.append(det)
+
+    key = jax.random.PRNGKey(42)
+    obj_c, arrays, params, config, _ = fdtdx.place_objects(
+        object_list=objects, config=config, constraints=constraints, key=key
+    )
+    arrays = fdtdx.extend_material_to_pml(objects=obj_c, arrays=arrays)
+    arrays, obj_c, _ = fdtdx.apply_params(arrays, obj_c, params, key)
+    return obj_c, arrays, config, key
+
+
+objects, arrays, config, key = build()
+print(f"grid {objects.volume.grid_shape}, {config.time_steps_total} time steps")
+
+# GOTCHA: run_fdtd defaults to show_progress=True, which puts an ordered
+# io_callback inside the loop. Fine interactively, but turn it off for
+# anything you are timing — it forces the device to sync with the host.
+run = jax.jit(fdtdx.run_fdtd, static_argnames=["show_progress"])
+
+t0 = time.perf_counter()
+final_step, out = run(arrays=arrays, objects=objects, config=config, key=key, show_progress=False)
+jax.block_until_ready(out)
+t_first = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+final_step, out = run(arrays=arrays, objects=objects, config=config, key=key, show_progress=False)
+jax.block_until_ready(out)
+t_warm = time.perf_counter() - t0
+
+print(f"first call (compile + run)  {t_first:6.2f} s")
+print(f"second call (run only)      {t_warm:6.2f} s   <- the real cost per simulation")
+
+# what the detector recorded 
+energy = np.asarray(out.detector_states["transmitted"]["energy"]).squeeze()
+print(f"\ndetector recorded shape {energy.shape}  (one value per time step)")
+
+peak = energy.max()
+bars = " .:-=+*#%@"
+print("\nenergy arriving above the slab, over time:")
+print("  " + "".join(bars[min(int(v / peak * (len(bars) - 1)), len(bars) - 1)] for v in energy))
+print(f"  starts at step 0, ends at step {len(energy) - 1}; peak = {peak:.3e}")
+
+# the final field, as a picture 
+E = np.asarray(out.fields.E)                       # (3, Nx, Ny, Nz)
+intensity = (E ** 2).sum(axis=0)                   # |E|^2
+xz = intensity[:, N // 2, :]                       # slice through y-centre
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.imshow(xz.T, origin="lower", cmap="magma", aspect="equal")
+    ax.axhspan(24, 35, color="cyan", alpha=0.18, label="silicon slab")
+    ax.axhline(11, color="w", ls="--", lw=1, label="source")
+    ax.set_xlabel("x (cells)")
+    ax.set_ylabel("z (cells)")
+    ax.set_title("|E|² at final time step, xz plane")
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig("step3_field.png", dpi=140)
+    print("\nwrote step3_field.png")
+except ImportError:
+    print("\n(matplotlib not available — skipped the plot)")
